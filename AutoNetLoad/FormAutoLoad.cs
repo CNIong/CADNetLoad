@@ -65,18 +65,60 @@
         private void AllCADVersionCombo_SelectedIndexChanged(object sender, EventArgs e)
         {
             this.listViewAssembly.Items.Clear();
-            RegistryKey key = Registry.CurrentUser.CreateSubKey(this.GetAutoCADKeyName(this.IntACADList.Text) + @"\Applications");
-            foreach (string subKeyName in key.GetSubKeyNames())
+
+            var cadKeyPath = this.GetAutoCADKeyName(this.IntACADList.Text) + @"\Applications";
+
+            // 先尝试 64 位视图，再回退 32 位视图
+            if (!TryFillFromRegistryView(cadKeyPath, RegistryView.Registry64))
             {
-                RegistryKey subKey = key.OpenSubKey(subKeyName);
-                if (subKey.GetValue("MANAGED") != null)
+                TryFillFromRegistryView(cadKeyPath, RegistryView.Registry32);
+            }
+        }
+
+        private bool TryFillFromRegistryView(string appKeyPath, RegistryView view)
+        {
+            try
+            {
+                using (var baseKey = RegistryKey.OpenBaseKey(RegistryHive.CurrentUser, view))
+                using (var appsKey = baseKey.OpenSubKey(appKeyPath, writable: false)) // 只读打开，不要 CreateSubKey
                 {
-                    ListViewItem item = new ListViewItem(subKeyName)
+                    if (appsKey == null) return false;
+
+                    foreach (var subName in appsKey.GetSubKeyNames())
                     {
-                        SubItems = { subKey.GetValue("LOADER").ToString() }
-                    };
-                    this.listViewAssembly.Items.Add(item);
+                        using (var subKey = appsKey.OpenSubKey(subName, writable: false))
+                        {
+                            if (subKey == null) continue;
+
+                            // MANAGED 常见为 DWORD=1；缺省按 0
+                            int managed = 0;
+                            try { managed = Convert.ToInt32(subKey.GetValue("MANAGED", 0)); } catch { /* 忽略类型不匹配 */ }
+                            if (managed != 1) continue;
+
+                            // 读 LOADER：可能为 REG_SZ/REG_EXPAND_SZ，也可能不存在
+                            object loaderObj = subKey.GetValue("LOADER", null, RegistryValueOptions.DoNotExpandEnvironmentNames);
+                            var loaderRaw = loaderObj as string;
+                            if (string.IsNullOrWhiteSpace(loaderRaw)) continue;
+
+                            // 展开环境变量（若原值是 REG_EXPAND_SZ）
+                            string loaderPath;
+                            try { loaderPath = Environment.ExpandEnvironmentVariables(loaderRaw); }
+                            catch { continue; }
+
+                            // 添加到 ListView
+                            var item = new System.Windows.Forms.ListViewItem(subName);
+                            item.SubItems.Add(loaderPath);
+                            this.listViewAssembly.Items.Add(item);
+                        }
+                    }
+
+                    return true;
                 }
+            }
+            catch
+            {
+                // 某些机器可能没有相应视图/权限等，吃掉异常交由上层回退
+                return false;
             }
         }
 
@@ -262,22 +304,60 @@
         [MethodImpl(MethodImplOptions.NoInlining)]
         private bool CheckLoaded(string cadVersionName)
         {
-            bool isLoaded = false;
-            RegistryKey key = Registry.CurrentUser.CreateSubKey(this.GetAutoCADKeyName(cadVersionName) + @"\Applications");
-            foreach (string subKeyName in key.GetSubKeyNames())
+            // 只读打开，不要 CreateSubKey
+            var appKeyPath = this.GetAutoCADKeyName(cadVersionName) + @"\Applications";
+
+            // 兼容 64 位视图（AutoCAD 一般写 HKCU\Software\...）
+            var view = Environment.Is64BitOperatingSystem ? RegistryView.Registry64 : RegistryView.Default;
+            using (var baseKey = RegistryKey.OpenBaseKey(RegistryHive.CurrentUser, view))
+            using (var appsKey = baseKey.OpenSubKey(appKeyPath, writable: false))
             {
-                RegistryKey subKey = key.OpenSubKey(subKeyName);
-                if (subKey.GetValue("MANAGED") != null)
+                if (appsKey == null) return false;
+
+                foreach (var subName in appsKey.GetSubKeyNames())
                 {
-                    string path = subKey.GetValue("LOADER").ToString();
-                    if (this.FYDLLNameRegex.IsMatch(Path.GetFileName(path)))
+                    using (var subKey = appsKey.OpenSubKey(subName, writable: false))
                     {
-                        isLoaded = true;
-                        break;
+                        if (subKey == null) continue;
+
+                        // MANAGED 常为 DWORD=1，缺省按 0 处理
+                        int managed = 0;
+                        try
+                        {
+                            managed = Convert.ToInt32(subKey.GetValue("MANAGED", 0));
+                        }
+                        catch { /* 忽略类型转换异常，按未托管处理 */ }
+
+                        if (managed != 1) continue;
+
+                        // LOADER 可能是 REG_SZ 或 REG_EXPAND_SZ
+                        object loaderObj = subKey.GetValue("LOADER", null, RegistryValueOptions.DoNotExpandEnvironmentNames);
+                        var loader = loaderObj as string;
+                        if (string.IsNullOrWhiteSpace(loader)) continue;
+
+                        // 展开环境变量（若为 REG_EXPAND_SZ）
+                        loader = Environment.ExpandEnvironmentVariables(loader);
+
+                        string fileName = null;
+                        try
+                        {
+                            fileName = Path.GetFileName(loader);
+                        }
+                        catch
+                        {
+                            // 路径非法时跳过
+                            continue;
+                        }
+
+                        if (!string.IsNullOrEmpty(fileName) && this.FYDLLNameRegex.IsMatch(fileName))
+                        {
+                            return true;
+                        }
                     }
                 }
             }
-            return isLoaded;
+
+            return false;
         }
 
         [MethodImpl(MethodImplOptions.NoInlining)]
